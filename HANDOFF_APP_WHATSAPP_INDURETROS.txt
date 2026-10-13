@@ -1,0 +1,1305 @@
+================================================================================
+ HANDOFF TECNICO - APP DE CAMPANAS WHATSAPP (GUPSHUP) - INDURETROS
+================================================================================
+ Documento de traspaso autocontenido. Version 1.0 - 2026-08-20
+ Destinatario: perfil tecnico senior (Python / Odoo / arquitectura hexagonal)
+ Objetivo: reemplazar los scripts PowerShell de envio masivo por una aplicacion
+ con nucleo reutilizable, ejecutable COMO MODULO DE ODOO y TAMBIEN POR FUERA.
+================================================================================
+
+INDICE
+------
+  0.  COMO USAR ESTE DOCUMENTO (prompt de arranque)
+  1.  CONTEXTO DE NEGOCIO Y OPERACION
+  2.  INVENTARIO DEL ESTADO ACTUAL
+  3.  CONTRATO DE LA API DE GUPSHUP (observado en produccion)
+  4.  DIAGNOSTICO: 10 DEFECTOS CON EVIDENCIA
+  5.  DECISIONES TOMADAS Y SUS CONSECUENCIAS
+  6.  EVALUACION DE STACK
+  7.  ARQUITECTURA (9 DIAGRAMAS)
+  8.  ESTRUCTURA DEL REPOSITORIO
+  9.  CONTRATOS DE CODIGO (puertos, casos de uso, firmas)
+  10. MODELO DE DATOS
+  11. CAPA ODOO: ESTRATEGIA 17 / 19
+  12. ESPECIFICACION DEL CLI
+  13. CONFIGURACION Y SECRETOS
+  14. FASES, ENTREGABLES Y CRITERIOS DE ACEPTACION
+  15. REQUISITOS NO FUNCIONALES (OWASP, Ley 1581, rate limits)
+  16. RIESGOS Y PENDIENTES ABIERTOS
+  17. GLOSARIO
+
+
+================================================================================
+ 0. COMO USAR ESTE DOCUMENTO
+================================================================================
+
+Este archivo es autocontenido: quien lo lea no necesita ver los scripts previos
+ni el historial del chat original. Para retomar el trabajo en una sesion nueva,
+pegar el archivo completo y a continuacion un encargo como este:
+
+  --------------------------------------------------------------------------
+  Adjunto el handoff tecnico de la app de campanas WhatsApp de Induretros.
+  Ya esta decidida la arquitectura (nucleo Python hexagonal + adaptadores
+  Odoo y CLI) y las tres decisiones de la seccion 5.
+
+  Quiero que implementes la FASE 1 (seccion 14): paquete induretros_wa_core
+  + CLI, con opt-out y consentimiento incluidos desde el inicio.
+
+  Restricciones: sintaxis Python 3.10 (debe correr en el venv de Odoo 17 y
+  de 19), cero dependencias de Odoo en el nucleo, tests con pytest sin red.
+  Trabaja fase por fase y confirma antes de pasar a la siguiente.
+
+  El repositorio va en: <RUTA QUE DEFINAS>
+  --------------------------------------------------------------------------
+
+Estado al cierre de esta version del documento:
+  - Fase 0 (rotar API key): PENDIENTE, responsabilidad del usuario.
+  - Fase 1: no iniciada. Falta definir la ruta del repositorio.
+  - Documento hermano en la misma carpeta: PLAN_APP_WHATSAPP.md (version corta).
+
+
+================================================================================
+ 1. CONTEXTO DE NEGOCIO Y OPERACION
+================================================================================
+
+Empresa    : Induretros (maquinaria pesada / retroexcavadoras, Colombia)
+Caso de uso: campanas salientes de WhatsApp a clientes y prospectos usando
+             plantillas (HSM) aprobadas por Meta, con y sin cabecera de media.
+Proveedor  : Gupshup (BSP de WhatsApp Business API)
+Linea      : 573007192973
+App Gupshup: Induretrosline2
+ERP        : Odoo 17 en produccion. Migracion a Odoo 19 pendiente.
+
+Volumen real observado:
+  - Lista mayor: 3.076 contactos (numeros_linea_verde_TODOS.csv)
+  - Lista de envio del 05/08: 370 contactos (contactos_res_partner_ENVIO.csv,
+    exportada desde res.partner de Odoo)
+  - ~9.000 envios acumulados entre junio y agosto de 2026, en 9 campanas.
+  - Ritmo actual: 1 mensaje/segundo fijo => ~51 minutos de consola bloqueada
+    para una campana de 3.076.
+
+Paises presentes en las listas (por prefijo, en orden de volumen):
+  Colombia (57), Venezuela (58), Ecuador (593), y algun caso de EEUU (1).
+
+Flujo operativo actual (manual, end to end):
+  1. Exportar contactos desde Odoo (res.partner) a CSV.
+  2. Editar a mano el CSV a dos columnas: numero,nombre
+  3. Editar el .ps1: pegar TEMPLATE_ID, URL del media, params.
+  4. Ejecutar validar_csv.ps1 y revisar la salida por consola.
+  5. Ejecutar enviar_masivo1.ps1, confirmar el envio de prueba, esperar ~1 hora
+     con la ventana de PowerShell abierta.
+  6. Guardar el CSV de reporte que queda en la carpeta.
+
+Todo el paso 3 al 6 ocurre en la maquina del operador, sin trazabilidad
+centralizada, sin control de acceso y sin registro de quien lanzo que campana.
+
+
+================================================================================
+ 2. INVENTARIO DEL ESTADO ACTUAL
+================================================================================
+
+Ruta: C:\Users\LuisPosada\OneDrive - Induretros\Escritorio\SCRIPTS\
+(OneDrive corporativo sincronizado - relevante para la seccion de seguridad)
+
+  enviar_masivo.ps1        8.845 B  Envio masivo, solo plantillas de texto.
+                                    API key EN TEXTO PLANO en el archivo.
+  enviar_masivo1.ps1      15.010 B  Evolucion del anterior. Anade cabecera de
+                                    media (image/video/document), params de
+                                    plantilla, envio de prueba previo,
+                                    verificacion HEAD de la URL del media,
+                                    TLS 1.2 forzado y lectura de la key desde
+                                    la variable de entorno GUPSHUP_API_KEY.
+                                    (Pero deja la key real en un comentario.)
+  validar_csv.ps1          4.770 B  Valida formato, detecta pais y duplicados.
+                                    Duplica la funcion Get-InfoPais.
+  contactos.csv               61 B  2 filas de prueba.
+  contactos_res_partner_ENVIO.csv   370 filas. Export de Odoo.
+  contactos_promocion.csv           3.076 filas.
+  numeros_linea_verde_TODOS.csv     3.076 filas.
+  contactos - copia.csv             respaldo.
+  reporte_envio_*.csv               9 reportes (jun-ago 2026).
+  microservices/                    Proyecto aparte, Go + arquitectura
+                                    hexagonal (catalog, inventory). Sirve como
+                                    referencia de estilo del equipo, NO se toca.
+  Pagina.sh                         No relacionado.
+
+Formato de entrada (CSV):
+  numero,nombre
+  573124318484,LUIS POSADA
+
+  Nota: algunos archivos traen BOM UTF-8, otros no. Los nombres con coma NO
+  vienen entrecomillados de forma consistente. Ver defecto #3.
+
+Formato de salida (reporte CSV), 9 columnas:
+  Numero, Destino, Pais, Codigo, Nombre, Status, MessageID, Error, Fecha
+
+Logica de negocio incrustada en los .ps1 (a preservar en el nucleo):
+  - Tabla de 25 prefijos telefonicos ordenada de mas largo a mas corto.
+  - Normalizacion: quitar todo lo que no sea digito; quitar prefijo "00";
+    si son 10 digitos y empiezan por 3 => anteponer 57 (Colombia por defecto).
+  - Validacion: el numero nacional resultante debe medir entre 7 y 11 digitos.
+  - Si no se identifica el pais => se OMITE el envio (no se gasta plantilla).
+  - Deduplicacion sobre el numero YA normalizado (solo en validar_csv.ps1).
+  - Verificacion previa del media: HEAD a la URL, avisar si devuelve text/html
+    (tipico de enlaces de Drive/Dropbox con vista previa) o si pesa mas de 5 MB.
+  - Envio de prueba a un numero antes de disparar la lista completa, con
+    confirmacion manual del operador.
+
+
+================================================================================
+ 3. CONTRATO DE LA API DE GUPSHUP (observado en produccion)
+================================================================================
+
+3.1 ENVIO DE PLANTILLA
+----------------------
+  POST https://api.gupshup.io/wa/api/v1/template/msg
+  Headers:
+    apikey: <SECRETO - leer de GUPSHUP_API_KEY>
+    Content-Type: application/x-www-form-urlencoded
+
+  Body (form-urlencoded):
+    source        = 573007192973
+    destination   = <E.164 sin el signo +>          ej. 573124318484
+    src.name      = Induretrosline2
+    template      = <JSON string>                    (obligatorio)
+    message       = <JSON string>                    (opcional: cabecera media)
+
+  template (JSON serializado dentro del campo de formulario):
+    {"id":"<uuid-de-plantilla>","params":["valor1","valor2"]}
+    - params en ORDEN, uno por cada {{n}} del cuerpo de la plantilla.
+    - Si la plantilla no tiene variables: "params":[]
+    - Las comillas dobles dentro de un valor deben escaparse.
+
+  message (solo si la plantilla tiene cabecera de media):
+    imagen   : {"type":"image","image":{"link":"https://..."}}
+    video    : {"type":"video","video":{"link":"https://..."}}
+    documento: {"type":"document","document":{"link":"https://...",
+                "filename":"promocion.pdf"}}
+
+    OBSERVACION CRITICA heredada del script: si la plantilla tiene cabecera de
+    media y NO se envia el campo "message", la API responde 200/submitted pero
+    el mensaje NUNCA se entrega. Es un fallo silencioso. El nucleo debe validar
+    esta coherencia ANTES de encolar: plantilla-con-media => media obligatorio.
+
+  Respuesta 200 (observada):
+    {"status":"submitted","messageId":"<uuid>"}
+
+    "submitted" significa ACEPTADO POR GUPSHUP. No significa entregado, ni
+    enviado a Meta, ni recibido por el destinatario. Es el origen del defecto #5.
+
+  Errores: llegan como cuerpo HTTP de error; el script los captura con
+  ErrorDetails.Message o Exception.Message. El nucleo debe parsear el JSON de
+  error y clasificar: 4xx de negocio (no reintentar) vs 429/5xx/red (reintentar).
+
+3.2 REQUISITOS DEL MEDIA (validados por el script actual)
+--------------------------------------------------------
+  - HTTPS obligatorio, publico, sin login.
+  - Enlace DIRECTO al archivo. Un Content-Type text/html indica pagina de
+    vista previa (Drive/Dropbox) y Meta lo rechaza.
+  - Aviso si Content-Length > 5 MB.
+  - El repositorio de media que ya usan es el CDN de Gupshup:
+    https://fss.gupshup.io/0/public/0/0/gupshup/573007192973/...
+
+3.3 WEBHOOK DE EVENTOS (A IMPLEMENTAR - NO EXISTE HOY)
+------------------------------------------------------
+  Gupshup entrega callbacks de estado (enqueued / sent / delivered / read /
+  failed) a una URL configurable en el panel de la app.
+
+  ATENCION: la forma exacta del payload NO esta verificada en este proyecto
+  porque hoy no se consume ningun webhook. Antes de implementar la seccion
+  correspondiente hay que:
+    (a) abrir el panel de Gupshup > la app Induretrosline2 > configuracion de
+        callback, y
+    (b) capturar un payload real contra un endpoint de prueba.
+  No dar por buena ninguna estructura de memoria. El correlacionador entre el
+  envio y el evento es el messageId devuelto en 3.1.
+
+
+================================================================================
+ 4. DIAGNOSTICO: 10 DEFECTOS CON EVIDENCIA
+================================================================================
+
+ #1  API KEY EN TEXTO PLANO                                        [CRITICO]
+     Evidencia: enviar_masivo.ps1 define $API_KEY con el valor literal.
+     enviar_masivo1.ps1 la movio a variable de entorno pero dejo el valor real
+     escrito en un comentario de ejemplo. Ambos archivos viven en OneDrive
+     corporativo sincronizado; hay ademas copia en Downloads/.
+     Impacto: cualquiera con acceso al SharePoint puede enviar WhatsApps desde
+     la linea de la empresa. La key debe considerarse comprometida y rotarse.
+
+ #2  ENCODING ROTO
+     Evidencia: reporte_envio_20260805_113023.csv contiene "PATIÑO" escrito
+     como PATI-A-tilde-O mal decodificado, "COMPAÑIA" y "NORCONSTRUCCION"
+     igualmente corruptos. Causa: Import-Csv -Encoding UTF8 sobre archivos que
+     en realidad estan en Windows-1252, o doble decodificacion del BOM.
+     Impacto: hoy solo ensucia el reporte. En cuanto un nombre se use como
+     parametro {{1}} de una plantilla, le llega texto corrupto al cliente.
+
+ #3  PARSEO CSV FRAGIL
+     Evidencia: en el mismo reporte hay filas donde el nombre de la empresa
+     quedo DENTRO de la columna Numero y la columna Nombre quedo vacia. Ocurre
+     con razones sociales que contienen coma, p.ej. la fila de EMCIVIL
+     INGENIERIA, la de MUNDIAL DE INVERSIONES y la de OBRAS CIVILES/OBALCON.
+     En el reporte del 05/08 hay 5 filas afectadas; en el del 17/07, 13 filas.
+     Impacto: datos inconsistentes, imposible auditar a quien se le envio.
+
+ #4  SIN IDEMPOTENCIA NI REANUDACION                                 [ALTO]
+     Evidencia: el bucle foreach no persiste progreso; el reporte se escribe
+     solo al terminar.
+     Impacto: si la consola se cierra en el envio 1.500 de 3.076, relanzar
+     reenvia los 1.500 primeros. Doble mensaje = riesgo de reporte por spam.
+
+ #5  SOLO SE REGISTRA "submitted"                                    [ALTO]
+     Evidencia: agregando los 9 reportes, TODOS los registros exitosos tienen
+     Status=submitted. Cero entregas, cero lecturas, cero fallos de entrega.
+     Sobre ~9.000 envios no existe un solo dato de entrega real.
+     Impacto: no se puede medir una campana ni depurar numeros muertos.
+
+ #6  SIN OPT-OUT NI CONSENTIMIENTO                                   [ALTO]
+     Evidencia: no existe lista de exclusion en ningun script. Existe en el
+     SharePoint la carpeta "AUTORIZACION TRATAMIENTO DE DATOS", es decir, el
+     consentimiento se gestiona en documentos, desconectado del envio.
+     Impacto: Ley 1581 de 2012 (Habeas Data) + politicas de Meta. Acumular
+     reportes de spam degrada la calidad de la linea y puede bloquearla.
+
+ #7  SIN REINTENTOS NI CONTROL DE TASA
+     Evidencia: Start-Sleep fijo de 1 s; el catch solo registra el error.
+     Impacto: un 429 o un corte de red momentaneo se registra como fallo
+     definitivo. No hay backoff ni reintento diferido.
+
+ #8  DEDUPLICACION SOLO EN EL VALIDADOR
+     Evidencia: validar_csv.ps1 mantiene el hash $numerosVistos, pero
+     enviar_masivo.ps1 no filtra duplicados al enviar.
+     Impacto: si el operador ignora el aviso del validador, doble mensaje.
+
+ #9  DETECCION DE PAIS ARTESANAL
+     Evidencia: tabla [ordered] de 25 prefijos escrita a mano; el prefijo "1"
+     al final captura cualquier numero que empiece por 1 y mida entre 8 y 12
+     digitos. La unica validacion es la longitud del resto (7 a 11).
+     Impacto: falsos positivos, y numeros invalidos que se envian igual.
+
+ #10 LOGICA DUPLICADA EN 3 SCRIPTS
+     Evidencia: Get-InfoPais esta copiada literalmente en enviar_masivo.ps1,
+     enviar_masivo1.ps1 y validar_csv.ps1.
+     Impacto: toda correccion hay que hacerla tres veces; ya divergieron los
+     comentarios entre copias.
+
+
+================================================================================
+ 5. DECISIONES TOMADAS Y SUS CONSECUENCIAS
+================================================================================
+
+ D1. ALCANCE STANDALONE: CLI primero, servicio web despues.
+     La Fase 1 entrega un CLI que reemplaza los tres .ps1. La UI web, Postgres
+     y el webhook quedan para la Fase 2.
+     Consecuencia: el motor queda probado y en uso antes de montarle interfaz.
+
+ D2. ODOO: produccion en 17, migracion a 19 pendiente. El addon se escribe
+     para 19 pero compatible con 17 desde el inicio.
+     Consecuencias tecnicas concretas:
+       - El nucleo se escribe con sintaxis Python 3.10 (no 3.12+), para que el
+         mismo paquete se instale en el venv de 17 y en el de 19.
+       - Nada de match/case exhaustivo dependiente de 3.11, ni tomllib, ni
+         ExceptionGroup, ni typing de 3.12.
+       - Una sola rama de codigo, con dos juegos de vistas XML seleccionados
+         por manifest, en vez de dos ramas del modulo completo. Ver seccion 11.
+
+ D3. HABEAS DATA: consentimiento y opt-out se modelan en el nucleo desde la
+     Fase 1, no se posponen.
+     Consecuencias:
+       - OptOut y Consent son entidades del dominio desde el primer commit.
+       - El filtro de exclusion es un paso OBLIGATORIO dentro de LaunchCampaign,
+         no un chequeo opcional que se pueda saltar por bandera.
+       - Como en la Fase 1 no hay Postgres, la lista de exclusion se persiste
+         en archivo local (JSONL) detras del puerto OptOutRepository; migra a
+         tabla en la Fase 2 sin tocar los casos de uso.
+
+ D4. (Implicita, del analisis) El nucleo NO importa Odoo bajo ninguna
+     circunstancia. Ni odoo.models, ni odoo.api, ni _ ni fields. La direccion
+     de dependencias es siempre: adaptador -> nucleo.
+
+
+================================================================================
+ 6. EVALUACION DE STACK
+================================================================================
+
+RESTRICCION QUE MANDA
+  El codigo debe ejecutarse DENTRO del proceso de Odoo 19 como modulo. Odoo es
+  Python. Por tanto el nucleo debe ser Python puro. El equipo ya tiene un
+  proyecto en Go con arquitectura hexagonal (SCRIPTS/microservices/), pero
+  replicar el motor en Go obligaria a duplicar toda la logica para el addon.
+  Descartado por esa razon, no por preferencia de lenguaje.
+
+OPCIONES EVALUADAS
+
+  A) TODO DENTRO DE ODOO (modulo Odoo puro)
+     + Aprovecha res.partner, ir.cron, seguridad, vistas y ORM ya existentes.
+     - No cumple el requisito de "y por fuera".
+     - Logica acoplada a la version de Odoo: migrar 17->19 arrastra el motor.
+     - Tests lentos: cada prueba necesita una BD de Odoo.
+     VEREDICTO: descartada.
+
+  B) MICROSERVICIO + MODULO ODOO DELGADO QUE LO LLAMA POR HTTP
+     + Un solo runtime del motor, Odoo queda como pura UI.
+     - El addon deja de ser autonomo: no funciona si el servicio esta caido.
+     - Dos despliegues, autenticacion servicio-a-servicio, latencia y un punto
+       de fallo extra para algo que puede correr en proceso.
+     VEREDICTO: descartada.
+
+  C) NUCLEO PYTHON HEXAGONAL + DOS ADAPTADORES              <== ELEGIDA
+     Un paquete induretros_wa_core sin una sola importacion de Odoo, consumido
+     por (1) el addon Odoo y (2) el CLI y luego el servicio FastAPI.
+     + Un solo motor, dos superficies de uso.
+     + Tests del motor en segundos, sin levantar Odoo.
+     + Portar 17 <-> 19 toca solo la capa fina de adaptador.
+     + Cumple SOLID: el motor depende de puertos (Protocol), no de Odoo ni de
+       SQLAlchemy ni de requests directamente.
+
+STACK CONCRETO
+
+  Capa        Eleccion                        Razon
+  ----------  ------------------------------  ------------------------------
+  Nucleo      Python 3.10+                    Compatible venv Odoo 17 y 19
+              requests                        Ya viene con Odoo, sin dep nueva
+              phonenumbers (opcional)         Port de libphonenumber; corrige
+                                              el defecto #9. Con fallback a la
+                                              tabla actual si no esta instalado
+  Tests       pytest + responses              Sin red, deterministas
+  CLI         Typer + rich                    Misma ergonomia que los .ps1
+  Servicio    FastAPI + Uvicorn               Tipado, OpenAPI, async worker
+  Datos       PostgreSQL (base separada)      Ya lo tienen por Odoo
+              SQLAlchemy 2 + Alembic          Migraciones versionadas
+  UI          Jinja2 + HTMX + Tailwind        Herramienta interna: una SPA
+                                              React seria sobreingenieria
+  Cola        Tabla outbox + worker propio    Patron transactional outbox.
+                                              Sin Redis/Celery al inicio; en
+                                              Odoo el mismo patron con ir.cron
+  Empaque     Docker Compose                  Docker 29 ya instalado
+
+DEPENDENCIAS QUE SE RECHAZAN EXPLICITAMENTE Y POR QUE
+  - Celery/Redis en Fase 2: el volumen (3k mensajes/campana, 1 msg/s) no lo
+    justifica. Un worker con tabla outbox es suficiente y no anade
+    infraestructura que operar.
+  - React/Vue: herramienta interna de bajo trafico, HTMX cubre el caso.
+  - OCA queue_job en Odoo: se evalua solo si ir.cron se queda corto.
+  - ORM propio o SQL a mano en el nucleo: el nucleo no habla con la BD, habla
+    con puertos.
+
+
+================================================================================
+ 7. ARQUITECTURA
+================================================================================
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 1 - CONTEXTO (C4 nivel 1)
+--------------------------------------------------------------------------------
+
+                        +---------------------------+
+                        |   Operador de campanas    |
+                        |   (Mercadeo / Comercial)  |
+                        +-------------+-------------+
+                                      |
+                       lanza y monitorea campanas
+                                      |
+                                      v
+        +-----------------------------------------------------------+
+        |            SISTEMA DE CAMPANAS WHATSAPP                   |
+        |            (nucleo + adaptadores)                         |
+        +-----------------------------------------------------------+
+             |                    |                       ^
+             |                    |                       |
+   lee/escribe contactos    envia plantillas        eventos de entrega
+             |                    |                    (webhook)
+             v                    v                       |
+     +---------------+   +------------------+   +---------------------+
+     |   Odoo (ERP)  |   |     Gupshup      |-->|   Meta / WhatsApp   |
+     |  res.partner  |   |  (BSP WhatsApp)  |   |     Cloud API       |
+     +---------------+   +------------------+   +----------+----------+
+                                                            |
+                                                            v
+                                                  +--------------------+
+                                                  | Cliente final      |
+                                                  | (destinatario)     |
+                                                  +--------------------+
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 2 - CONTENEDORES (C4 nivel 2)
+--------------------------------------------------------------------------------
+
+  +--------------------------------------------------------------------------+
+  |                          MISMA LOGICA DE NEGOCIO                         |
+  |                                                                          |
+  |   +------------------------------------------------------------------+   |
+  |   |   induretros_wa_core   (paquete pip, Python 3.10, 0 dep de Odoo)  |   |
+  |   |   dominio + casos de uso + puertos + gateway Gupshup + CSV IO     |   |
+  |   +------------------------------------------------------------------+   |
+  +--------------------------------------------------------------------------+
+        ^                          ^                            ^
+        | importa                  | importa                    | importa
+        |                          |                            |
+  +-----+---------+     +----------+-----------+     +----------+-----------+
+  |  CLI  "wa"    |     |  Servicio standalone |     |  Addon Odoo          |
+  |  (Typer)      |     |  FastAPI + Uvicorn   |     |  induretros_whatsapp |
+  |               |     |  + worker outbox     |     |  + ir.cron           |
+  |  FASE 1       |     |  FASE 2              |     |  FASE 3              |
+  +-------+-------+     +----------+-----------+     +----------+-----------+
+          |                        |                            |
+          v                        v                            v
+   +-------------+        +------------------+        +--------------------+
+   | Archivos    |        | PostgreSQL       |        | PostgreSQL de Odoo |
+   | CSV / JSONL |        | (base propia)    |        | (tablas wa_*)      |
+   +-------------+        +------------------+        +--------------------+
+
+  Nota: el CLI de Fase 1 persiste en archivos. Cuando llega la Fase 2, el mismo
+  CLI puede apuntar a Postgres cambiando solo la inyeccion de repositorios.
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 3 - HEXAGONAL: PUERTOS Y ADAPTADORES
+--------------------------------------------------------------------------------
+
+   ADAPTADORES PRIMARIOS                                ADAPTADORES SECUNDARIOS
+   (conducen la aplicacion)                             (la aplicacion los usa)
+
+  +------------------+                                  +---------------------+
+  |  CLI  (Typer)    |--\                            /--|  GupshupGateway     |
+  +------------------+   \                          /   |  (requests + retry) |
+  +------------------+    \    +----------------+  /    +---------------------+
+  |  FastAPI routes  |-----+-->|                |-+     +---------------------+
+  +------------------+    /    |   CASOS DE USO |  \    |  CsvContactSource   |
+  +------------------+   /     |   (application)|   \---|  (encoding + quote) |
+  |  Odoo wizard /   |--/      |                |       +---------------------+
+  |  ir.cron         |         +--------+-------+   /---+---------------------+
+  +------------------+                  |          /    |  Repos:             |
+                                        v         /     |   - InMemory (test) |
+                              +-------------------+     |   - JsonlFile (F1)  |
+                              |     DOMINIO       |-----|   - SqlAlchemy (F2) |
+                              |  entidades, VOs,  |     |   - OdooOrm    (F3) |
+                              |  reglas, eventos  |     +---------------------+
+                              +-------------------+     +---------------------+
+                                                        |  Clock, RateLimiter |
+   REGLA DE DEPENDENCIA:                                |  EventPublisher     |
+   las flechas SIEMPRE apuntan                          +---------------------+
+   hacia el dominio. El dominio
+   no importa nada de fuera.
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 4 - SECUENCIA: LANZAMIENTO DE UNA CAMPANA
+--------------------------------------------------------------------------------
+
+ Operador   Adaptador   LaunchCampaign  OptOutRepo  CampaignRepo  Outbox  Worker  Gupshup
+    |           |             |              |            |          |       |        |
+    |--lanzar-->|             |              |            |          |       |        |
+    |           |--ejecutar-->|              |            |          |       |        |
+    |           |             |              |            |          |       |        |
+    |           |    [1] normalizar y validar numeros     |          |       |        |
+    |           |             |              |            |          |       |        |
+    |           |    [2] deduplicar sobre E.164           |          |       |        |
+    |           |             |              |            |          |       |        |
+    |           |    [3] filtrar exclusiones  |            |          |       |        |
+    |           |             |--consultar-->|            |          |       |        |
+    |           |             |<--excluidos--|            |          |       |        |
+    |           |             |              |            |          |       |        |
+    |           |    [4] validar coherencia plantilla/media          |       |        |
+    |           |        (si tiene cabecera media -> media obligatorio)      |        |
+    |           |             |              |            |          |       |        |
+    |           |    [5] crear campana en estado DRAFT    |          |       |        |
+    |           |             |---------------------------->|         |       |        |
+    |           |             |              |            |          |       |        |
+    |           |    [6] encolar N mensajes (una transaccion)        |        |
+    |           |             |------------------------------------->|        |
+    |           |             |         clave unica (campaign_id, e164)       |
+    |           |<--resumen---|              |            |          |       |        |
+    |<--preview-|             |              |            |          |       |        |
+    |           |             |              |            |          |       |        |
+    |--confirmar->|           |              |            |          |       |        |
+    |           |    [7] campana -> QUEUED   |            |          |       |        |
+    |           |             |              |            |          |       |        |
+    |           |             |              |            |          |<-poll-|        |
+    |           |             |              |            |          |--lote->|        |
+    |           |             |              |            |          |       |--POST->|
+    |           |             |              |            |          |       |<-msgId-|
+    |           |             |              |            |          |<-SENT-|        |
+    |           |             |              |            |          |       |        |
+    |           |             |              |            |     (rate limiter entre envios)
+
+  Punto clave: el operador ve el PREVIEW (cuantos validos, cuantos excluidos,
+  cuantos duplicados, distribucion por pais) ANTES de confirmar. El paso 6 no
+  envia nada: solo encola. El envio real lo hace el worker, de forma reanudable.
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 5 - MAQUINA DE ESTADOS DEL MENSAJE
+--------------------------------------------------------------------------------
+
+                            +---------+
+                            |  DRAFT  |
+                            +----+----+
+                                 | encolar
+                                 v
+            +------------------------------------------+
+            |                 QUEUED                   |<--------+
+            +----+--------------------------------+----+         |
+                 |                                |              |
+       envio OK  |                    error 4xx / |              | reintento
+       (submitted)                    invalido    |              | (backoff
+                 v                                v              |  exponencial)
+            +---------+                     +----------+         |
+            |  SENT   |                     |  FAILED  |---------+
+            +----+----+                     +----------+     (si es reintentable
+                 |                                |           y quedan intentos)
+      webhook    |                                |
+   "delivered"   v                                | agotados los intentos
+          +-------------+                         v
+          |  DELIVERED  |                   +------------+
+          +------+------+                   |  DEAD      |
+                 |                          | (definitivo)|
+      webhook    |                          +------------+
+      "read"     v
+          +-------------+
+          |    READ     |
+          +-------------+
+
+     Rama de exclusion (no llega a encolarse):
+          +-----------+
+          |  SKIPPED  |   motivo: INVALID_NUMBER | DUPLICATE | OPTED_OUT
+          +-----------+           | NO_CONSENT   | UNKNOWN_COUNTRY
+
+  Clasificacion de errores para decidir reintento:
+    REINTENTABLE     : timeout, error de red, 429, 5xx
+    NO REINTENTABLE  : 400 de negocio, plantilla inexistente, numero invalido,
+                       cuenta sin saldo, media rechazado
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 6 - PATRON OUTBOX Y REANUDACION (resuelve el defecto #4)
+--------------------------------------------------------------------------------
+
+  TRANSACCION 1 (rapida, atomica)        TRANSACCION N (una por lote, aparte)
+  +---------------------------+          +-------------------------------------+
+  | INSERT campaign           |          | SELECT ... FROM wa_message          |
+  | INSERT wa_message x N     |          |  WHERE campaign_id = ?              |
+  |   estado = QUEUED         |          |    AND state = 'QUEUED'             |
+  |   UNIQUE(campaign_id,e164)|          |  ORDER BY id LIMIT <lote>           |
+  +---------------------------+          |  FOR UPDATE SKIP LOCKED             |
+                                         +------------------+------------------+
+                                                            |
+                                          por cada mensaje del lote:
+                                                            v
+                                         +-------------------------------------+
+                                         | rate_limiter.acquire()              |
+                                         | gateway.send_template(...)          |
+                                         | UPDATE estado, message_id, intentos |
+                                         | COMMIT por mensaje (no por lote)    |
+                                         +-------------------------------------+
+
+  Por que esto resuelve la reanudacion:
+    - El estado vive en la BD, no en la memoria del proceso.
+    - Si el proceso muere, los QUEUED siguen siendo QUEUED; al reiniciar,
+      el worker los retoma. Los SENT nunca se reenvian.
+    - El UNIQUE(campaign_id, phone_e164) impide encolar dos veces el mismo
+      destinatario aunque el CSV traiga duplicados o se relance el import.
+    - FOR UPDATE SKIP LOCKED permite mas de un worker sin doble envio.
+
+  En la FASE 1 (sin BD) el equivalente es un archivo JSONL append-only por
+  campana, con fsync tras cada envio, y un indice en memoria de los e164 ya
+  procesados. Misma semantica, distinto adaptador; el caso de uso no cambia.
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 7 - MODELO DE DATOS (ERD)
+--------------------------------------------------------------------------------
+
+  +------------------+          +----------------------+
+  |    wa_template   |          |     wa_contact       |
+  +------------------+          +----------------------+
+  | id (PK)          |          | id (PK)              |
+  | gupshup_uuid     |          | phone_e164   UNIQUE  |
+  | nombre           |          | nombre               |
+  | idioma           |          | pais_iso2            |
+  | tiene_media      |          | odoo_partner_id NULL |
+  | tipo_media       |          | activo               |
+  | n_params         |          +----------+-----------+
+  | estado_meta      |                     |
+  +--------+---------+                     | 1
+           |                               |
+           | 1                             | N
+           |                    +----------+-----------+
+           | N                  |      wa_message      |
+  +--------+---------+          +----------------------+
+  |    wa_campaign   | 1      N | id (PK)              |
+  +------------------+----------+ campaign_id (FK)     |
+  | id (PK)          |          | contact_id (FK) NULL |
+  | nombre           |          | phone_e164           |
+  | template_id (FK) |          | nombre_snapshot      |
+  | media_url        |          | params_json          |
+  | media_tipo       |          | estado               |
+  | media_filename   |          | motivo_skip          |
+  | params_json      |          | gupshup_message_id   |
+  | estado           |          | intentos             |
+  | creado_por       |          | ultimo_error         |
+  | creado_en        |          | encolado_en          |
+  | lanzado_en       |          | enviado_en           |
+  | terminado_en     |          | entregado_en         |
+  +------------------+          | leido_en             |
+                                +----------+-----------+
+                                           |
+                                           | 1
+  +----------------------+                 | N
+  |     wa_optout        |      +----------+-----------+
+  +----------------------+      |   wa_delivery_event  |
+  | id (PK)              |      +----------------------+
+  | phone_e164   UNIQUE  |      | id (PK)              |
+  | motivo               |      | message_id (FK)      |
+  | origen               |      | tipo                 |
+  | creado_en            |      | payload_json         |
+  +----------------------+      | recibido_en          |
+                                +----------------------+
+  +----------------------+
+  |     wa_consent       |     UNIQUE(campaign_id, phone_e164) en wa_message
+  +----------------------+     <== esta es la clave de idempotencia
+  | id (PK)              |
+  | phone_e164           |     Indices adicionales:
+  | otorgado             |       wa_message(campaign_id, estado)
+  | fuente               |       wa_message(gupshup_message_id)
+  | documento_ref        |       wa_optout(phone_e164)
+  | fecha                |
+  +----------------------+
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 8 - DESPLIEGUE
+--------------------------------------------------------------------------------
+
+  MODO A: DENTRO DE ODOO (Fase 3)
+  +---------------------------------------------------------------+
+  |  Servidor Odoo                                                |
+  |  +---------------------------------------------------------+  |
+  |  |  proceso odoo (venv)                                    |  |
+  |  |   +-------------------------+   +--------------------+  |  |
+  |  |   | addon                   |-->| induretros_wa_core |  |  |
+  |  |   | induretros_whatsapp     |   | (pip en el venv)   |  |  |
+  |  |   |  - models (wa.*)        |   +--------------------+  |  |
+  |  |   |  - wizard de envio      |                           |  |
+  |  |   |  - ir.cron -> Outbox    |                           |  |
+  |  |   |  - controller /webhook  |                           |  |
+  |  |   +-------------------------+                           |  |
+  |  +---------------------------------------------------------+  |
+  |                          |                                    |
+  |                          v                                    |
+  |            +---------------------------+                      |
+  |            |  PostgreSQL de Odoo       |                      |
+  |            |  (tablas wa_* del addon)  |                      |
+  |            +---------------------------+                      |
+  +---------------------------------------------------------------+
+                             |  HTTPS
+                             v
+                       [ api.gupshup.io ]
+                             ^
+                             |  callbacks -> /gupshup/webhook
+
+  MODO B: FUERA DE ODOO (Fases 1 y 2)
+  +---------------------------------------------------------------+
+  |  docker compose                                               |
+  |   +----------------+  +----------------+  +----------------+  |
+  |   |  api (FastAPI) |  |  worker        |  |  postgres      |  |
+  |   |  UI HTMX       |  |  outbox loop   |  |  base propia   |  |
+  |   +--------+-------+  +--------+-------+  +-------+--------+  |
+  |            |                   |                  |           |
+  |            +---------+---------+------------------+           |
+  |                      |                                        |
+  |            +---------+----------+                             |
+  |            | induretros_wa_core |                             |
+  |            +--------------------+                             |
+  +---------------------------------------------------------------+
+        El CLI de Fase 1 corre en el equipo del operador sin nada de esto.
+
+
+--------------------------------------------------------------------------------
+ DIAGRAMA 9 - PIPELINE DE NORMALIZACION DE UN NUMERO
+--------------------------------------------------------------------------------
+
+   "  +57 (312) 431-8484 "
+            |
+            v
+   [1] quitar todo lo que no sea digito          -> "573124318484"
+            |
+            v
+   [2] quitar prefijo internacional "00"         -> (si venia 0057...)
+            |
+            v
+   [3] heurística de numero sin indicativo:
+       longitud == 10 y empieza por "3"          -> anteponer "57"
+            |
+            v
+   [4] resolver pais
+       (a) con phonenumbers si esta instalado    -> region + validez real
+       (b) si no, tabla de 25 prefijos           -> mas largo primero
+            |
+            v
+   [5] validar longitud nacional (7 a 11)
+            |
+            +---- no valida ----> SKIPPED / UNKNOWN_COUNTRY (no se envia)
+            |
+            v
+   [6] PhoneNumber(e164="573124318484", pais="CO", indicativo="57")
+            |
+            v
+   [7] deduplicar por e164  (573124318484 y 3124318484 colapsan al mismo)
+            |
+            v
+   [8] contrastar contra OptOutRepository        -> SKIPPED / OPTED_OUT
+            |
+            v
+        ENCOLABLE
+
+   Los pasos 1 a 3 y 5 replican exactamente la logica actual de Get-InfoPais,
+   para no cambiar el comportamiento observado. El paso 4(a) y el 8 son nuevos.
+
+
+================================================================================
+ 8. ESTRUCTURA DEL REPOSITORIO
+================================================================================
+
+  induretros-whatsapp/
+  |
+  +-- packages/core/                      # distribuible pip: induretros-wa-core
+  |   +-- pyproject.toml                  # requires-python = ">=3.10"
+  |   +-- induretros_wa/
+  |       +-- __init__.py
+  |       +-- domain/
+  |       |   +-- value_objects.py        # PhoneNumber, TemplateRef, MediaHeader
+  |       |   +-- entities.py             # Contact, Campaign, Message, OptOut...
+  |       |   +-- enums.py                # MessageState, SkipReason, MediaType
+  |       |   +-- events.py               # MessageSent, MessageDelivered...
+  |       |   +-- errors.py               # excepciones de dominio
+  |       +-- application/
+  |       |   +-- ports.py                # Protocol: gateway, repos, clock...
+  |       |   +-- dto.py                  # CampaignPreview, SendResult...
+  |       |   +-- use_cases/
+  |       |       +-- import_contacts.py
+  |       |       +-- validate_contacts.py
+  |       |       +-- preview_campaign.py
+  |       |       +-- send_test_message.py
+  |       |       +-- launch_campaign.py
+  |       |       +-- process_outbox.py
+  |       |       +-- register_delivery_event.py
+  |       |       +-- handle_opt_out.py
+  |       |       +-- build_report.py
+  |       +-- infrastructure/
+  |           +-- gupshup/
+  |           |   +-- client.py           # HTTP, timeouts, backoff
+  |           |   +-- mapper.py           # dominio <-> payload de Gupshup
+  |           |   +-- errors.py           # clasificacion reintentable/no
+  |           +-- csvio/
+  |           |   +-- reader.py           # deteccion de encoding + BOM
+  |           |   +-- writer.py           # quoting correcto
+  |           +-- phone/
+  |           |   +-- resolver.py         # phonenumbers + fallback tabla
+  |           |   +-- country_table.py    # los 25 prefijos actuales
+  |           +-- persistence/
+  |               +-- memory/             # repos en memoria (tests)
+  |               +-- jsonl/              # repos en archivo (Fase 1)
+  |
+  +-- apps/cli/                           # Typer. Fase 1
+  |   +-- wa/__main__.py
+  |   +-- wa/commands/
+  |
+  +-- apps/api/                           # FastAPI + SQLAlchemy + HTMX. Fase 2
+  |   +-- main.py  routers/  templates/  static/
+  |   +-- persistence/sqlalchemy/         # repos SQL
+  |   +-- worker.py                       # loop de outbox
+  |   +-- alembic/
+  |
+  +-- odoo/addons/induretros_whatsapp/    # Fase 3
+  |   +-- __manifest__.py
+  |   +-- __init__.py
+  |   +-- models/                         # wa_campaign.py, wa_message.py...
+  |   +-- wizards/                        # wizard "Enviar campana WhatsApp"
+  |   +-- controllers/                    # webhook de Gupshup
+  |   +-- views/
+  |   |   +-- common/                     # vistas comunes 17 y 19
+  |   |   +-- v17/                        # <tree>
+  |   |   +-- v19/                        # <list>
+  |   +-- security/
+  |   |   +-- ir.model.access.csv
+  |   |   +-- security.xml                # grupos y record rules
+  |   +-- data/                           # ir.cron
+  |   +-- i18n/
+  |
+  +-- tests/
+  |   +-- unit/                           # dominio y casos de uso
+  |   +-- integration/                    # gateway con responses
+  |   +-- fixtures/                       # CSVs con los defectos reales
+  |
+  +-- docker-compose.yml
+  +-- Makefile
+  +-- README.md
+  +-- docs/
+
+  COMO EL ADDON CONSUME EL NUCLEO (dos vias, en orden de preferencia):
+    1) "external_dependencies": {"python": ["induretros_wa_core"]} en el
+       manifest + pip install en el venv de Odoo. Es lo limpio.
+    2) Si no hay acceso a pip en el servidor: carpeta vendor/ dentro del addon,
+       anadida a sys.path desde __init__.py. Menos elegante pero no obliga a
+       tocar el entorno del servidor.
+
+
+================================================================================
+ 9. CONTRATOS DE CODIGO
+================================================================================
+
+Firmas orientativas. El objetivo es fijar la FORMA de las dependencias, no
+imponer la implementacion. Todo con typing compatible con Python 3.10.
+
+  # ---------------- domain/value_objects.py ----------------
+  @dataclass(frozen=True)
+  class PhoneNumber:
+      e164: str            # solo digitos, sin '+', tal como lo quiere Gupshup
+      country_code: str    # "57"
+      country_iso2: str    # "CO"
+      national: str
+
+      @classmethod
+      def parse(cls, raw: str, default_country: str = "CO") -> "PhoneNumber":
+          """Lanza InvalidPhoneNumber si no se puede resolver."""
+
+  @dataclass(frozen=True)
+  class MediaHeader:
+      type: MediaType      # IMAGE | VIDEO | DOCUMENT
+      url: str
+      filename: str | None = None   # obligatorio si type == DOCUMENT
+
+  @dataclass(frozen=True)
+  class TemplateRef:
+      gupshup_uuid: str
+      params: tuple[str, ...] = ()
+      requires_media: bool = False
+
+  # ---------------- application/ports.py ----------------
+  class MessageGateway(Protocol):
+      def send_template(
+          self,
+          destination: PhoneNumber,
+          template: TemplateRef,
+          media: MediaHeader | None = None,
+      ) -> GatewayResult: ...
+      # GatewayResult: (accepted: bool, provider_message_id: str | None,
+      #                 error_code: str | None, retryable: bool)
+
+  class OptOutRepository(Protocol):
+      def is_opted_out(self, e164: str) -> bool: ...
+      def bulk_filter(self, e164s: Iterable[str]) -> set[str]: ...
+      def add(self, e164: str, reason: str, source: str) -> None: ...
+
+  class CampaignRepository(Protocol):
+      def create(self, campaign: Campaign) -> CampaignId: ...
+      def get(self, id: CampaignId) -> Campaign: ...
+      def enqueue_messages(self, id: CampaignId, msgs: Sequence[Message]) -> int: ...
+      def claim_batch(self, id: CampaignId, size: int) -> list[Message]: ...
+      def mark_sent(self, msg_id, provider_id: str, at: datetime) -> None: ...
+      def mark_failed(self, msg_id, error: str, retryable: bool) -> None: ...
+
+  class RateLimiter(Protocol):
+      def acquire(self) -> None: ...      # bloquea hasta que haya cupo
+
+  class Clock(Protocol):
+      def now(self) -> datetime: ...      # inyectado: nunca datetime.now()
+                                          # directo en el dominio, rompe tests
+
+  # ---------------- application/use_cases/launch_campaign.py ----------------
+  class LaunchCampaign:
+      def __init__(self, campaigns: CampaignRepository,
+                   optouts: OptOutRepository, clock: Clock): ...
+
+      def preview(self, spec: CampaignSpec,
+                  contacts: Iterable[RawContact]) -> CampaignPreview:
+          """No envia nada. Normaliza, deduplica, filtra exclusiones y valida
+          la coherencia plantilla/media. Devuelve el desglose para que el
+          operador confirme."""
+
+      def execute(self, spec: CampaignSpec,
+                  contacts: Iterable[RawContact]) -> CampaignId:
+          """Crea la campana y encola. El filtro de opt-out es obligatorio."""
+
+  # ---------------- application/use_cases/process_outbox.py ----------------
+  class ProcessOutbox:
+      def __init__(self, campaigns: CampaignRepository,
+                   gateway: MessageGateway, limiter: RateLimiter,
+                   clock: Clock, max_attempts: int = 3): ...
+
+      def run_batch(self, campaign_id: CampaignId, size: int = 50) -> BatchResult:
+          """Idempotente y reanudable. Este MISMO metodo lo invocan el worker
+          de FastAPI y el ir.cron de Odoo. Ninguno de los dos duplica logica."""
+
+INVARIANTES QUE DEBEN QUEDAR CUBIERTAS POR TESTS
+  I1. Un e164 no puede encolarse dos veces en la misma campana.
+  I2. Un numero en la lista de opt-out nunca llega al gateway.
+  I3. Una plantilla con requires_media=True y media=None no se puede lanzar.
+  I4. Un fallo reintentable vuelve a QUEUED hasta agotar max_attempts.
+  I5. Un fallo no reintentable pasa a DEAD sin consumir mas intentos.
+  I6. Reanudar una campana no reenvia ningun mensaje ya en SENT o posterior.
+  I7. La normalizacion es idempotente: parse(parse(x)) == parse(x).
+  I8. Un CSV con nombre entrecomillado que contiene coma se lee correctamente.
+  I9. Un CSV en Windows-1252 y otro en UTF-8-BOM producen el mismo resultado.
+
+
+================================================================================
+ 10. MODELO DE DATOS
+================================================================================
+
+Ver el ERD del diagrama 7. Detalles que no caben en el diagrama:
+
+  wa_message.estado  : DRAFT|QUEUED|SENT|DELIVERED|READ|FAILED|DEAD|SKIPPED
+  wa_message.motivo_skip : INVALID_NUMBER|DUPLICATE|OPTED_OUT|NO_CONSENT|
+                           UNKNOWN_COUNTRY
+  wa_message.params_json : snapshot de los params con los que se envio.
+                           Importante: la plantilla puede cambiar despues; el
+                           mensaje debe conservar lo que realmente se mando.
+  wa_message.nombre_snapshot : idem, el nombre tal como estaba al enviar.
+
+  wa_campaign.estado : DRAFT|QUEUED|RUNNING|PAUSED|DONE|CANCELLED
+
+  RESTRICCION CLAVE:
+    UNIQUE (campaign_id, phone_e164) ON wa_message
+    Es lo que hace idempotente el encolado. Sin esto no hay reanudacion segura.
+
+  RETENCION:
+    Definir con negocio cuanto se guardan los payload_json de wa_delivery_event.
+    Contienen datos personales. Propuesta inicial: 12 meses, luego purga
+    automatica dejando solo el estado agregado.
+
+  EQUIVALENCIA CON EL REPORTE ACTUAL:
+    El reporte CSV de hoy (Numero, Destino, Pais, Codigo, Nombre, Status,
+    MessageID, Error, Fecha) se puede reconstruir integramente desde wa_message
+    con un JOIN a wa_campaign. Mantener esa exportacion en la Fase 1 para que
+    el operador no pierda su formato conocido.
+
+
+================================================================================
+ 11. CAPA ODOO: ESTRATEGIA 17 / 19
+================================================================================
+
+PRINCIPIO: los modelos Odoo son ADAPTADORES, no logica. Un metodo de wa.campaign
+debe leerse como "traduzco al dominio, llamo al caso de uso, escribo el
+resultado". Si aparece una regla de negocio dentro de un modelo Odoo, esta mal
+puesta.
+
+  class WaCampaign(models.Model):
+      _name = "wa.campaign"
+
+      def action_launch(self):
+          self.ensure_one()
+          use_case = LaunchCampaign(
+              campaigns=OdooCampaignRepository(self.env),
+              optouts=OdooOptOutRepository(self.env),
+              clock=OdooClock(self.env),
+          )
+          campaign_id = use_case.execute(self._to_spec(), self._iter_contacts())
+          self.write({"state": "queued"})
+
+  El ir.cron llama a ProcessOutbox.run_batch(...) exactamente igual que el
+  worker de FastAPI. Cero duplicacion.
+
+DIFERENCIAS 17 vs 19 A CONTEMPLAR
+  - Vistas de lista: Odoo 17 introdujo <list> como reemplazo de <tree>; en las
+    versiones siguientes <tree> queda deprecado. Estrategia adoptada: carpetas
+    views/v17/ y views/v19/ con el mismo contenido salvo esa etiqueta, y el
+    manifest incluye una u otra segun la version detectada.
+  - 'version' del manifest y dependencias declaradas.
+  - Posibles cambios en la API de mail/activity si se integra con el chatter.
+
+  IMPORTANTE PARA QUIEN IMPLEMENTE: NO dar por buenas estas diferencias de
+  memoria. Antes de escribir el addon hay que verificarlas contra la instancia
+  real de 17 y contra una 19 de pruebas. Este documento las senala como puntos
+  a comprobar, no como hechos cerrados.
+
+INTEGRACION CON res.partner
+  - Campo calculado con el movil normalizado a E.164.
+  - Campos de consentimiento y opt-out en el partner, sincronizados con
+    wa_optout / wa_consent.
+  - Accion de servidor para lanzar campana desde la vista lista de contactos.
+  - Esto elimina el ida y vuelta por CSV que hoy generan exportando
+    contactos_res_partner_ENVIO.csv.
+
+SEGURIDAD DEL ADDON
+  - Grupos: "WhatsApp / Operador" (lanza campanas) y "WhatsApp / Responsable"
+    (ademas configura plantillas y credenciales).
+  - ir.model.access.csv restrictivo por defecto.
+  - Record rules por compania si aplica multi-compania.
+  - La API key va en ir.config_parameter con lectura restringida al grupo
+    Responsable, NUNCA en un campo visible en vista.
+
+
+================================================================================
+ 12. ESPECIFICACION DEL CLI (FASE 1)
+================================================================================
+
+  wa validate <archivo.csv> [--default-country CO] [--report salida.csv]
+      Reemplaza validar_csv.ps1. Reporta: total, validos, invalidos,
+      duplicados, excluidos por opt-out, distribucion por pais.
+      Codigo de salida != 0 si hay invalidos, para poder encadenar en scripts.
+
+  wa test --to <numero> --template <uuid> [--media <url>] [--media-type image]
+          [--param "valor" ...]
+      Envia un unico mensaje de prueba. Equivale al bloque NUMERO_PRUEBA del
+      script actual. Verifica la URL del media (HEAD) antes de enviar.
+
+  wa send <archivo.csv> --template <uuid>
+          [--media <url> --media-type image|video|document]
+          [--media-filename doc.pdf] [--param "valor" ...]
+          [--rate 1/s] [--dry-run] [--yes] [--name "Campana agosto"]
+      Ejecuta preview, muestra el desglose, pide confirmacion (salvo --yes) y
+      encola + envia. --dry-run no toca la red.
+
+  wa resume <campaign-id>
+      Retoma una campana interrumpida. No reenvia lo ya enviado.
+
+  wa status <campaign-id>
+      Progreso y desglose por estado.
+
+  wa report <campaign-id> [--out reporte.csv|.xlsx]
+      Exporta con las 9 columnas del formato actual.
+
+  wa optout add <numero> [--reason "..."]
+  wa optout import <archivo.csv>
+  wa optout list
+
+  wa consent import <archivo.csv>
+      Carga el consentimiento documentado (ver seccion 15).
+
+  CONVENCIONES
+    - Todo comando acepta --json para salida legible por maquina.
+    - Sin colores si no hay TTY.
+    - La API key SOLO desde entorno o gestor de secretos; nunca por argumento
+      (quedaria en el historial del shell y en la lista de procesos).
+
+
+================================================================================
+ 13. CONFIGURACION Y SECRETOS
+================================================================================
+
+  Variable                     Uso                          Obligatoria
+  ---------------------------  ---------------------------  -----------
+  GUPSHUP_API_KEY              credencial de la API         si
+  GUPSHUP_SOURCE               573007192973                 si
+  GUPSHUP_APP_NAME             Induretrosline2              si
+  GUPSHUP_BASE_URL             https://api.gupshup.io       no (default)
+  WA_DEFAULT_COUNTRY           CO                           no (default)
+  WA_RATE_PER_SECOND           1.0                          no (default)
+  WA_MAX_ATTEMPTS              3                            no (default)
+  WA_SEND_WINDOW               "08:00-19:00"                no
+  WA_TIMEZONE                  America/Bogota               no
+  DATABASE_URL                 postgres://... (Fase 2)      Fase 2
+  WA_WEBHOOK_SECRET            validacion del callback      Fase 2
+
+  En Odoo, los mismos valores viven en ir.config_parameter con las claves
+  wa.gupshup.api_key, wa.gupshup.source, etc., legibles solo por el grupo
+  Responsable.
+
+  REGLAS DE MANEJO DE SECRETOS
+    - Nunca en el repositorio. .env en .gitignore desde el primer commit.
+    - Nunca en la carpeta de OneDrive sincronizada.
+    - Nunca en logs: al registrar la request, enmascarar el header apikey.
+    - Rotacion documentada y con responsable asignado.
+
+
+================================================================================
+ 14. FASES, ENTREGABLES Y CRITERIOS DE ACEPTACION
+================================================================================
+
+FASE 0 - SEGURIDAD INMEDIATA                          [PENDIENTE - del usuario]
+  Acciones:
+    - Rotar la API key en el panel de Gupshup.
+    - Eliminar el valor de enviar_masivo.ps1, del comentario de
+      enviar_masivo1.ps1 y de las copias en Downloads/.
+    - Dejarla unicamente como variable de entorno.
+    - Revisar quien tuvo acceso al SharePoint mientras estuvo expuesta.
+  Aceptacion: grep de la key en toda la carpeta sin resultados; los scripts
+  siguen funcionando leyendo del entorno.
+  No requiere codigo nuevo. Independiente del resto.
+
+FASE 1 - NUCLEO + CLI
+  Entregables:
+    - Paquete induretros_wa_core instalable, Python 3.10, sin dependencias
+      de Odoo ni de FastAPI.
+    - Dominio completo incluyendo OptOut y Consent (decision D3).
+    - GupshupGateway con timeouts, backoff exponencial y clasificacion de
+      errores reintentables.
+    - Lector CSV que resuelve los defectos #2 y #3.
+    - Persistencia JSONL reanudable (defecto #4).
+    - CLI wa con los comandos de la seccion 12.
+    - Suite pytest cubriendo las invariantes I1..I9.
+  Aceptacion:
+    - Reprocesar contactos_res_partner_ENVIO.csv en --dry-run produce
+      exactamente 370 destinatarios validos, sin filas corridas y sin mojibake.
+    - Matar el proceso a mitad de una campana de prueba y relanzar con
+      wa resume no genera ni un solo reenvio.
+    - Un numero en opt-out no aparece en la salida del gateway (verificado con
+      un doble de prueba, no contra la API real).
+    - Los tres .ps1 quedan archivados.
+
+FASE 2 - PERSISTENCIA + SERVICIO STANDALONE
+  Entregables:
+    - Esquema Postgres + migraciones Alembic.
+    - Repos SQLAlchemy implementando los mismos puertos (sin tocar casos de uso).
+    - Worker de outbox con rate limit y ventana horaria.
+    - FastAPI + UI HTMX: cargar CSV, previsualizar, lanzar, ver progreso en
+      vivo, reintentar fallidos, exportar reporte.
+    - Webhook /webhooks/gupshup con validacion de origen (defecto #5).
+    - Autenticacion, roles y auditoria de quien lanzo cada campana.
+    - docker-compose.
+  Aceptacion:
+    - Una campana de 3.076 corre sin la consola del operador abierta.
+    - Los estados delivered/read/failed llegan y se ven en la UI.
+    - Migrar de JSONL a Postgres no cambia ni una linea de application/.
+
+FASE 3 - MODULO ODOO
+  Entregables:
+    - Addon induretros_whatsapp para 19, compatible con 17.
+    - Modelos wa.template, wa.campaign, wa.message, wa.optout como adaptadores.
+    - Integracion con res.partner (movil normalizado, consentimiento, opt-out).
+    - Wizard de envio desde la vista lista de contactos.
+    - ir.cron invocando ProcessOutbox.run_batch.
+    - Controller del webhook.
+    - Grupos, ir.model.access.csv y record rules.
+  Aceptacion:
+    - Instalable en una 17 y en una 19 sin cambios de codigo Python.
+    - Lanzar una campana desde Odoo produce el mismo resultado que el CLI.
+    - Ya no hace falta exportar CSV desde res.partner.
+
+FASE 4 - ENDURECIMIENTO Y OPERACION
+  Entregables:
+    - Repaso OWASP completo (seccion 15).
+    - Tablero de metricas por campana y por pais.
+    - Plantillas versionadas y verificacion previa del media.
+    - Ventanas horarias y calendario de envio.
+    - Pruebas de carga con la lista real de 3.076.
+    - Politica de retencion y purga de datos personales.
+
+
+================================================================================
+ 15. REQUISITOS NO FUNCIONALES
+================================================================================
+
+15.1 SEGURIDAD (OWASP, aplicado a este caso)
+  A01 Control de acceso roto
+      - Roles Operador / Responsable. Solo Responsable ve o cambia credenciales.
+      - En Odoo: record rules, no solo ocultar botones en la vista.
+  A02 Fallos criptograficos
+      - TLS obligatorio hacia Gupshup. Secretos fuera del repositorio.
+  A03 Inyeccion
+      - El campo template viaja como JSON serializado: construirlo con
+        json.dumps, NUNCA con concatenacion de strings como hacen los .ps1
+        actuales (Build-TemplateJson concatena y escapa comillas a mano).
+      - SQL siempre parametrizado / via ORM.
+  A04 Diseno inseguro
+      - Preview obligatorio antes de enviar; envio de prueba antes del masivo.
+      - Confirmacion explicita para campanas por encima de un umbral.
+  A05 Mala configuracion
+      - Sin valores por defecto peligrosos; fallar si falta un secreto.
+  A07 Fallos de identificacion
+      - Sesiones con expiracion en la UI de Fase 2.
+  A08 Fallos de integridad
+      - Verificar el origen del webhook antes de aceptar un evento; si no,
+        cualquiera puede falsear estados de entrega.
+  A09 Fallos de registro y monitoreo
+      - Log estructurado de cada envio con quien, cuando, a que campana.
+      - Enmascarar el header apikey y no volcar numeros completos en logs de
+        nivel INFO.
+  A10 SSRF
+      - La URL del media es entrada del usuario y el sistema le hace un HEAD.
+        Validar esquema https, resolver y rechazar direcciones internas
+        (127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16, ::1).
+        Este vector ya existe hoy en enviar_masivo1.ps1 sin ninguna validacion.
+
+15.2 CUMPLIMIENTO (Colombia)
+  - Ley 1581 de 2012 y decreto 1377 de 2013: tratamiento de datos personales.
+  - Existe la carpeta "AUTORIZACION TRATAMIENTO DE DATOS" en el SharePoint:
+    hay que conectar ese consentimiento documentado con el envio, que es
+    justamente lo que hoy no ocurre.
+  - Mecanismo de opt-out honrado en menos de 24 h.
+  - Registro de la base legal por contacto: quien autorizo, cuando y como.
+  - Politicas de Meta/WhatsApp: solo plantillas aprobadas fuera de la ventana
+    de 24 h; los reportes de spam degradan la calidad de la linea y pueden
+    llevar a su bloqueo. Esto es riesgo operativo directo, no solo legal.
+
+15.3 RENDIMIENTO Y LIMITES
+  - Objetivo: 3.076 mensajes sin intervencion humana ni consola abierta.
+  - Rate limit configurable; arrancar en 1 msg/s (lo actual) y subir solo tras
+    confirmar el limite real de la cuenta en Gupshup y la calidad de la linea.
+  - Lotes de 50 con commit por mensaje: un fallo no pierde el lote entero.
+  - Timeout de 15 s por request (igual que hoy), 3 intentos con backoff.
+
+15.4 OBSERVABILIDAD
+  - Log estructurado JSON.
+  - Metricas por campana: encolados, enviados, entregados, leidos, fallidos,
+    omitidos y el desglose por motivo.
+  - El reporte CSV actual se conserva como exportacion.
+
+
+================================================================================
+ 16. RIESGOS Y PENDIENTES ABIERTOS
+================================================================================
+
+  R1. [BLOQUEANTE PARA EMPEZAR] Definir la ruta del repositorio. Los scripts
+      viven hoy en OneDrive sincronizado, que no es buen sitio para un repo
+      git. Propuesta: C:\Users\LuisPosada\Proyectos\induretros-whatsapp\
+      Pendiente confirmar si existe un remoto corporativo donde deba vivir.
+
+  R2. [ALTO] La API key sigue expuesta hasta que se ejecute la Fase 0.
+
+  R3. [ALTO] La forma del payload del webhook de Gupshup NO esta verificada.
+      Hay que capturar uno real antes de implementar la Fase 2. No asumirla.
+
+  R4. [MEDIO] Limite de tasa real de la cuenta Gupshup: desconocido. Confirmar
+      en el panel antes de subir de 1 msg/s.
+
+  R5. [MEDIO] Calidad actual de la linea 573007192973 en Meta: desconocida.
+      Tras ~9.000 envios sin opt-out conviene revisarla antes de la proxima
+      campana.
+
+  R6. [MEDIO] Alcance del consentimiento: hay que decidir si se digitaliza el
+      historico de la carpeta AUTORIZACION TRATAMIENTO DE DATOS o si solo se
+      registra de aqui en adelante.
+
+  R7. [MEDIO] Diferencias reales entre Odoo 17 y 19 para este addon: a
+      verificar contra instancias reales, no de memoria.
+
+  R8. [BAJO] Los datos historicos de los 9 reportes tienen filas corruptas
+      (defectos #2 y #3). Decidir si se importan al sistema nuevo, se importan
+      marcados como sucios, o se dejan como archivo historico.
+
+  R9. [BAJO] Version de Python del venv de Odoo 17 en produccion: confirmar
+      que es >= 3.10 antes de fijar esa base.
+
+
+================================================================================
+ 17. GLOSARIO
+================================================================================
+
+  BSP            Business Solution Provider. Intermediario autorizado por Meta
+                 para la WhatsApp Business API. Aqui: Gupshup.
+  HSM / Plantilla Mensaje preaprobado por Meta, obligatorio para iniciar
+                 conversacion fuera de la ventana de 24 h.
+  Ventana 24h    Periodo tras el ultimo mensaje del cliente en el que se puede
+                 responder con texto libre. Fuera de ella, solo plantillas.
+  E.164          Formato internacional de numero telefonico. Gupshup lo espera
+                 sin el signo '+'.
+  Outbox         Patron: se persiste la intencion de enviar en la misma
+                 transaccion que el cambio de estado, y un proceso aparte la
+                 despacha. Da reanudacion e idempotencia.
+  Puerto         Interfaz que declara el nucleo y que un adaptador implementa.
+                 En Python, un typing.Protocol.
+  Adaptador      Implementacion concreta de un puerto (Gupshup, Postgres,
+                 el ORM de Odoo, un doble de prueba).
+  submitted      Estado que devuelve Gupshup al aceptar la peticion. NO
+                 significa entregado. Confundirlos es el defecto #5.
+  Idempotencia   Repetir la operacion no cambia el resultado. Aqui: relanzar
+                 una campana no reenvia lo ya enviado.
+
+================================================================================
+ FIN DEL DOCUMENTO
+================================================================================
